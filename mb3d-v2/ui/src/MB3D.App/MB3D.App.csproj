@@ -1,0 +1,58 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    SPDX-License-Identifier: LicenseRef-MB3D-V2-Proprietary
+    Copyright (c) 2026 KenTread. All Rights Reserved.
+
+    WinForms x64 shell. DockPanelSuite provides the multi-window docking
+    layout; AvalonEdit backs the GLSL/Lua editors.
+  -->
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>            <!-- AvalonEdit is a WPF control, hosted in ElementHost -->
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <LangVersion>13.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <RootNamespace>MB3D.App</RootNamespace>
+    <AssemblyName>MB3D-V2</AssemblyName>
+    <Version>2.0.0</Version>
+    <Company>KenTread</Company>
+    <Product>MB3D-V2</Product>
+    <Copyright>Copyright (c) 2026 KenTread. All Rights Reserved.</Copyright>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="DockPanelSuite" Version="3.1.1" />
+    <PackageReference Include="DockPanelSuite.ThemeVS2015" Version="3.1.1" />
+    <PackageReference Include="AvalonEdit" Version="6.3.0.90" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\MB3D.Interop\MB3D.Interop.csproj" />
+    <ProjectReference Include="..\MB3D.Formats\MB3D.Formats.csproj" />
+  </ItemGroup>
+
+  <!--
+    The native core is built by CMake into build/bin. Copy it next to the
+    managed output so [LibraryImport("MB3D_Core")] resolves without any
+    PATH juggling during development.
+  -->
+  <ItemGroup>
+    <None Include="..\..\..\build\bin\MB3D_Core.*" Condition="Exists('..\..\..\build\bin')">
+      <Link>%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Include="..\..\..\build\bin\shaders\*.spv" Condition="Exists('..\..\..\build\bin\shaders')">
+      <Link>shaders\%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+</Project>

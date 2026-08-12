@@ -1,0 +1,16 @@
+build/
+out/
+bin/
+obj/
+*.user
+*.suo
+.vs/
+.vscode/
+.idea/
+CMakeUserPresets.json
+THIRD-PARTY-NOTICES.generated.md
+corpus/
+crash-*
+leak-*
+timeout-*
+*.spv

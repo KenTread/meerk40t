@@ -1,0 +1,742 @@
+// SPDX-License-Identifier: LicenseRef-MB3D-V2-Proprietary
+// Copyright (c) 2026 KenTread. All Rights Reserved.
+// Proprietary and confidential -- see LICENSE for terms.
+//
+// raymarch.comp -- GPU distance-estimator raymarcher.
+//
+// This is the GPU twin of CpuRaymarcher.cpp. When the two disagree the
+// CPU path is authoritative; core/tests/RaymarchParity compares them
+// pixel-for-pixel over a fixed scene set.
+//
+// One invocation renders one pixel. Workgroups are 8x8 because a fractal
+// boundary makes neighbouring pixels wildly divergent in step count, and
+// a smaller tile keeps the whole subgroup from waiting on one straggler.
+
+#version 450
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+#define MB3D_FORMULA_SLOTS   6
+#define MB3D_LIGHT_CHANNELS  6
+#define MB3D_GRADIENT_ENTRIES 256
+#define MB3D_FORMULA_PARAMS  12
+
+// Slot descriptors mirror mb3d_formula_slot_t's numeric fields. Names
+// and the char array are resolved host-side into `builtin_id`.
+struct FormulaSlot {
+    int   builtin_id;        // index into the dispatch switch below
+    int   enabled;
+    int   hybrid_mode;
+    int   iteration_weight;
+    int   start_iteration;
+    int   stop_iteration;
+    int   julia_enabled;
+    float interpolate_factor;
+    vec4  julia_c;
+    vec4  params0;           // params[0..3]
+    vec4  params1;           // params[4..7]
+    vec4  params2;           // params[8..11]
+    ivec4 iparams;
+    vec4  rotation;          // xyz used
+};
+
+struct LightChannel {
+    int   kind;
+    int   enabled;
+    int   casts_shadow;
+    float intensity;
+    vec4  color;             // rgb + falloff
+    vec4  position;          // xyz + specular
+    vec4  material;          // specular_exponent, diffuse, ambient_mix, shadow_softness
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer SceneBuffer {
+    // Camera basis, pre-computed host-side so the shader never touches
+    // Euler angles.
+    vec4 camera_origin;      // xyz + half_width
+    vec4 camera_forward;     // xyz + half_height
+    vec4 camera_right;       // xyz + projection mode
+    vec4 camera_up;          // xyz + far_clip
+
+    // Calculation controls.
+    vec4 calc0;              // max_iterations, escape_radius, raystep_mul, stepwidth_limit
+    vec4 calc1;              // de_stop, de_max_steps, binary_search_steps, normal_epsilon
+    vec4 calc2;              // de_scale, bound_sphere_enabled, bound_sphere_radius, bound_box_enabled
+    vec4 bound_sphere_center;
+    vec4 bound_box_min;
+    vec4 bound_box_max;
+
+    // Coloring.
+    vec4 color0;             // trap_kind, trap_size, trap_influence, trap_min_iteration
+    vec4 color1;             // speed, offset, cycle, smooth_iteration
+    vec4 trap_center;
+    vec4 trap_normal;
+
+    // Lighting.
+    vec4 ambient_a;
+    vec4 ambient_b;
+    vec4 fog_a;
+    vec4 fog_b;
+    vec4 fog_params;         // start, end, density, ambient_falloff
+    vec4 tone;               // gamma, contrast, brightness, saturation
+    vec4 post;               // exposure, ssao_radius, ssao_intensity, ssao_samples
+
+    int  hybrid_master_mode;
+    int  slot_count;
+    int  supersample;
+    int  seed;
+
+    FormulaSlot  slots[MB3D_FORMULA_SLOTS];
+    LightChannel lights[MB3D_LIGHT_CHANNELS];
+} scene;
+
+layout(set = 0, binding = 1, std430) readonly buffer GradientBuffer {
+    uint entries[MB3D_GRADIENT_ENTRIES];
+} gradient;
+
+layout(set = 0, binding = 2, std430) writeonly buffer ColorOut  { vec4  data[]; } out_color;
+layout(set = 0, binding = 3, std430) writeonly buffer DepthOut  { float data[]; } out_depth;
+layout(set = 0, binding = 4, std430) writeonly buffer NormalOut { vec4  data[]; } out_normal;
+
+layout(push_constant) uniform PushConstants {
+    ivec2 image_size;
+    ivec4 crop;              // x, y, w, h
+    int   layer_mask;
+    int   eye;               // 0 left / mono, 1 right
+} pc;
+
+// ---------------------------------------------------------------------
+// Iteration state
+// ---------------------------------------------------------------------
+
+struct IterState {
+    vec3  z;
+    vec3  c;
+    float w;
+    float cw;
+    float dr;
+    float r;
+    float trap;
+    int   iteration;
+    int   escaped_at;
+};
+
+vec3 rotate_euler(vec3 v, vec3 degrees) {
+    vec3 a = radians(degrees);
+    vec3 s = sin(a), co = cos(a);
+    vec3 r = v;
+    r = vec3(r.x, co.x * r.y - s.x * r.z, s.x * r.y + co.x * r.z);
+    r = vec3(co.y * r.x + s.y * r.z, r.y, -s.y * r.x + co.y * r.z);
+    r = vec3(co.z * r.x - s.z * r.y, s.z * r.x + co.z * r.y, r.z);
+    return r;
+}
+
+// -- formula step functions, one per builtin_id ----------------------
+
+void step_bulb3d(inout IterState s, FormulaSlot slot) {
+    float power = slot.params0.x != 0.0 ? slot.params0.x : 8.0;
+    float r = length(s.z);
+    s.r = r;
+    if (r < 1e-6) return;
+
+    s.dr = pow(r, power - 1.0) * power * s.dr + 1.0;
+
+    float theta = acos(clamp(s.z.z / r, -1.0, 1.0)) * power + radians(slot.params2.x);
+    float phi   = atan(s.z.y, s.z.x) * power + radians(slot.params1.w);
+    float zr    = pow(r, power);
+
+    s.z = zr * vec3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
+    s.z += slot.params1.xyz + s.c;
+}
+
+void step_bulb4d(inout IterState s, FormulaSlot slot) {
+    float power = slot.params0.x != 0.0 ? slot.params0.x : 8.0;
+    float r = length(vec4(s.z, s.w));
+    s.r = r;
+    if (r < 1e-6) return;
+
+    s.dr = pow(r, power - 1.0) * power * s.dr + 1.0;
+
+    float r3 = length(s.z) + 1e-30;
+    float t1 = acos(clamp(s.z.z / r3, -1.0, 1.0)) * power;
+    float t2 = atan(s.z.y, s.z.x) * power;
+    float t3 = acos(clamp(s.w / r, -1.0, 1.0)) * power;
+    float rp = pow(r, power);
+
+    s.z = rp * vec3(sin(t3) * sin(t1) * cos(t2),
+                    sin(t3) * sin(t1) * sin(t2),
+                    sin(t3) * cos(t1));
+    s.w = rp * cos(t3);
+    s.z += s.c;
+    s.w += s.cw;
+}
+
+void step_mandelbox(inout IterState s, FormulaSlot slot) {
+    float scale = slot.params0.x != 0.0 ? slot.params0.x : 2.0;
+    float minR  = slot.params0.y != 0.0 ? slot.params0.y : 0.5;
+    float fixR  = slot.params0.z != 0.0 ? slot.params0.z : 1.0;
+    float lim   = slot.params0.w != 0.0 ? slot.params0.w : 1.0;
+
+    // Box fold, branch-free: clamp then reflect.
+    s.z = clamp(s.z, -lim, lim) * 2.0 - s.z;
+
+    float r2 = dot(s.z, s.z);
+    if (r2 < minR * minR) {
+        float f = (fixR * fixR) / (minR * minR);
+        s.z *= f;
+        s.dr *= f;
+    } else if (r2 < fixR * fixR) {
+        float f = (fixR * fixR) / r2;
+        s.z *= f;
+        s.dr *= f;
+    }
+
+    s.z = s.z * scale + s.c;
+    s.dr = s.dr * abs(scale) + 1.0;
+    s.r = length(s.z);
+}
+
+void step_fold(inout IterState s, FormulaSlot slot) {
+    float scale = slot.params0.x != 0.0 ? slot.params0.x : 3.0;
+    vec3  offset = vec3(slot.params1.x != 0.0 ? slot.params1.x : 1.0,
+                        slot.params1.y, slot.params1.z);
+    float a1 = radians(slot.params2.x);
+    float a2 = radians(slot.params2.y);
+
+    s.z = abs(s.z);
+    if (s.z.x < s.z.y) s.z.xy = s.z.yx;
+    if (s.z.x < s.z.z) s.z.xz = s.z.zx;
+    if (s.z.y < s.z.z) s.z.yz = s.z.zy;
+
+    if (a1 != 0.0) {
+        float ca = cos(a1), sa = sin(a1);
+        s.z = vec3(ca * s.z.x - sa * s.z.y, sa * s.z.x + ca * s.z.y, s.z.z);
+    }
+
+    float shift = 0.5 * offset.z * (scale - 1.0) / scale;
+    s.z.z -= shift;
+    s.z.z = -abs(-s.z.z);
+    s.z.z += shift;
+
+    if (a2 != 0.0) {
+        float ca = cos(a2), sa = sin(a2);
+        s.z = vec3(ca * s.z.x - sa * s.z.z, s.z.y, sa * s.z.x + ca * s.z.z);
+    }
+
+    s.z = s.z * scale - vec3(offset.xy, 0.0) * (scale - 1.0);
+    s.dr *= abs(scale);
+    s.r = length(s.z);
+}
+
+void step_transform(inout IterState s, FormulaSlot slot) {
+    int variant = slot.iparams.x;
+    if (variant == 0) {
+        s.z = rotate_euler(s.z, slot.rotation.xyz);
+    } else if (variant == 1) {
+        vec3 centre = slot.params1.xyz;
+        float radius = slot.params0.x != 0.0 ? slot.params0.x : 1.0;
+        vec3 d = s.z - centre;
+        float r2 = max(dot(d, d), 1e-18);
+        float f = radius * radius / r2;
+        s.z = centre + d * f;
+        s.dr *= f;
+    } else if (variant == 2) {
+        vec3 period = max(slot.params1.xyz, vec3(1e-6));
+        s.z -= period * round(s.z / period);
+    } else if (variant == 3) {
+        if ((slot.iparams.y & 1) != 0) s.z.x = abs(s.z.x);
+        if ((slot.iparams.y & 2) != 0) s.z.y = abs(s.z.y);
+        if ((slot.iparams.y & 4) != 0) s.z.z = abs(s.z.z);
+    } else if (variant == 4) {
+        float k = slot.params0.x != 0.0 ? slot.params0.x : 1.0;
+        s.z = s.z * k + slot.params1.xyz;
+        s.dr *= abs(k);
+    }
+    s.r = length(s.z);
+}
+
+void step_ifs(inout IterState s, FormulaSlot slot) {
+    float scale = slot.params0.x != 0.0 ? slot.params0.x : 2.0;
+    vec3 offset = vec3(slot.params1.x != 0.0 ? slot.params1.x : 1.0,
+                       slot.params1.y != 0.0 ? slot.params1.y : 1.0,
+                       slot.params1.z != 0.0 ? slot.params1.z : 1.0);
+    s.z = abs(s.z);
+    if (s.z.x + s.z.y < 0.0) s.z.xy = -s.z.yx;
+    if (s.z.x + s.z.z < 0.0) s.z.xz = -s.z.zx;
+    if (s.z.y + s.z.z < 0.0) s.z.yz = -s.z.zy;
+    s.z = s.z * scale - offset * (scale - 1.0);
+    s.dr *= abs(scale);
+    s.r = length(s.z);
+}
+
+void run_slot(inout IterState s, FormulaSlot slot) {
+    switch (slot.builtin_id) {
+        case 0: step_bulb3d(s, slot);    break;
+        case 1: step_bulb4d(s, slot);    break;
+        case 2: step_mandelbox(s, slot); break;
+        case 3: step_fold(s, slot);      break;
+        case 4: step_transform(s, slot); break;
+        case 5: step_ifs(s, slot);       break;
+        // MB3D_CUSTOM_FORMULA_BODIES is substituted by the host at
+        // pipeline-build time with `case N:` blocks generated from the
+        // GLSL bodies of registered .m3f/.d3f formulas.
+        MB3D_CUSTOM_FORMULA_BODIES
+        default: step_bulb3d(s, slot);   break;
+    }
+}
+
+// Which slot runs at iteration i. Must match pick_slot() in
+// FormulaLibrary.cpp exactly.
+int pick_slot(int i) {
+    int n = scene.slot_count;
+    if (n <= 1) return 0;
+
+    if (scene.hybrid_master_mode == 2) {          // ALTERNATE
+        return i % n;
+    }
+    if (scene.hybrid_master_mode == 4) {          // DECOMB
+        if ((i & 1) == 0) return 0;
+        return 1 + ((i / 2) % (n - 1));
+    }
+    int total = 0;
+    for (int k = 0; k < n; ++k) total += scene.slots[k].iteration_weight;
+    if (total <= 0) return 0;
+    int pos = i % total;
+    for (int k = 0; k < n; ++k) {
+        if (pos < scene.slots[k].iteration_weight) return k;
+        pos -= scene.slots[k].iteration_weight;
+    }
+    return n - 1;
+}
+
+float orbit_trap(vec3 z) {
+    int kind = int(scene.color0.x);
+    vec3 d = z - scene.trap_center.xyz;
+    vec3 n = normalize(scene.trap_normal.xyz + vec3(0.0, 1e-9, 0.0));
+    float size = scene.color0.y;
+
+    if (kind == 1) return length(d);
+    if (kind == 2) return length(d - n * dot(d, n));
+    if (kind == 3) {
+        vec3 a = abs(d);
+        return min(min(length(a.yz), length(a.xz)), length(a.xy));
+    }
+    if (kind == 4) {
+        vec3 a = abs(d) - vec3(size);
+        return length(max(a, 0.0)) + min(max(a.x, max(a.y, a.z)), 0.0);
+    }
+    if (kind == 5) return abs(dot(d, n));
+    if (kind == 6) return abs(length(d) - size);
+    return 1e30;
+}
+
+// ---------------------------------------------------------------------
+// Distance estimator
+// ---------------------------------------------------------------------
+
+float distance_estimate(vec3 point, out IterState final_state) {
+    IterState s;
+    s.z = point;
+    s.c = point;
+    s.w = 0.0;
+    s.cw = 0.0;
+    s.dr = 1.0;
+    s.r = length(point);
+    s.trap = 1e30;
+    s.iteration = 0;
+    s.escaped_at = -1;
+
+    int max_iter = int(scene.calc0.x);
+    float escape2 = scene.calc0.y * scene.calc0.y;
+    int trap_kind = int(scene.color0.x);
+    int trap_min = int(scene.color0.w);
+
+    for (int i = 0; i < max_iter; ++i) {
+        int index = pick_slot(i);
+        FormulaSlot slot = scene.slots[index];
+        if (slot.enabled == 0) continue;
+        if (i < slot.start_iteration) continue;
+        if (slot.stop_iteration >= 0 && i > slot.stop_iteration) continue;
+
+        s.iteration = i;
+
+        if (slot.julia_enabled != 0) {
+            s.c = slot.julia_c.xyz;
+            s.cw = slot.julia_c.w;
+        }
+        if (slot.builtin_id != 4 && any(notEqual(slot.rotation.xyz, vec3(0.0)))) {
+            s.z = rotate_euler(s.z, slot.rotation.xyz);
+        }
+
+        if (scene.hybrid_master_mode == 3 && scene.slot_count > 1) {
+            IterState alt = s;
+            run_slot(s, slot);
+            run_slot(alt, scene.slots[(index + 1) % scene.slot_count]);
+            float t = clamp(slot.interpolate_factor, 0.0, 1.0);
+            s.z = mix(s.z, alt.z, t);
+            s.dr = mix(s.dr, alt.dr, t);
+            s.w = mix(s.w, alt.w, t);
+        } else {
+            run_slot(s, slot);
+        }
+
+        if (trap_kind != 0 && i >= trap_min) {
+            s.trap = min(s.trap, orbit_trap(s.z));
+        }
+
+        float r2 = dot(s.z, s.z) + s.w * s.w;
+        s.r = sqrt(r2);
+        if (r2 > escape2) { s.escaped_at = i; break; }
+    }
+
+    final_state = s;
+
+    float dr = max(abs(s.dr), 1e-12);
+    float de = 0.5 * log(max(s.r, 1e-12)) * s.r / dr;
+    if (scene.calc2.x > 0.0) de *= scene.calc2.x;
+    return isinf(de) || isnan(de) ? 0.0 : de;
+}
+
+float de_only(vec3 p) {
+    IterState ignored;
+    return distance_estimate(p, ignored);
+}
+
+vec3 surface_normal(vec3 p, float hit_distance) {
+    float e = max(scene.calc1.w, 1e-6) * max(1.0, hit_distance);
+    vec2 k = vec2(1.0, -1.0);
+    // Tetrahedral sampling: four DE evaluations instead of six.
+    return normalize(k.xyy * de_only(p + k.xyy * e) +
+                     k.yyx * de_only(p + k.yyx * e) +
+                     k.yxy * de_only(p + k.yxy * e) +
+                     k.xxx * de_only(p + k.xxx * e));
+}
+
+// ---------------------------------------------------------------------
+// Ray setup and marching
+// ---------------------------------------------------------------------
+
+bool clip_ray(vec3 origin, vec3 dir, out float t_near, out float t_far) {
+    t_near = 0.0;
+    t_far = scene.camera_up.w > 0.0 ? scene.camera_up.w : 100.0;
+
+    if (scene.calc2.y != 0.0) {
+        vec3 oc = origin - scene.bound_sphere_center.xyz;
+        float radius = scene.calc2.z > 0.0 ? scene.calc2.z : 2.0;
+        float b = dot(oc, dir);
+        float c = dot(oc, oc) - radius * radius;
+        float disc = b * b - c;
+        if (disc < 0.0) return false;
+        float sq = sqrt(disc);
+        t_near = max(t_near, -b - sq);
+        t_far  = min(t_far,  -b + sq);
+        if (t_near > t_far) return false;
+    }
+
+    if (scene.calc2.w != 0.0) {
+        vec3 inv = 1.0 / (abs(dir) < vec3(1e-12) ? vec3(1e-12) : dir);
+        vec3 t0 = (scene.bound_box_min.xyz - origin) * inv;
+        vec3 t1 = (scene.bound_box_max.xyz - origin) * inv;
+        vec3 lo = min(t0, t1);
+        vec3 hi = max(t0, t1);
+        t_near = max(t_near, max(lo.x, max(lo.y, lo.z)));
+        t_far  = min(t_far,  min(hi.x, min(hi.y, hi.z)));
+        if (t_near > t_far) return false;
+    }
+    return true;
+}
+
+struct Hit {
+    bool  hit;
+    float distance;
+    vec3  position;
+    vec3  normal;
+    IterState state;
+};
+
+Hit march(vec3 origin, vec3 dir) {
+    Hit h;
+    h.hit = false;
+    h.distance = 0.0;
+    h.position = origin;
+    h.normal = vec3(0.0, 0.0, 1.0);
+
+    float t, t_far;
+    if (!clip_ray(origin, dir, t, t_far)) {
+        distance_estimate(origin, h.state);
+        return h;
+    }
+
+    float step_mul = scene.calc0.z > 0.0 ? scene.calc0.z : 1.0;
+    float step_max = scene.calc0.w > 0.0 ? scene.calc0.w : 1e30;
+    float stop = scene.calc1.x > 0.0 ? scene.calc1.x : 1e-5;
+    int max_steps = int(scene.calc1.y);
+    int refine = int(scene.calc1.z);
+
+    float prev_t = t;
+    for (int i = 0; i < max_steps && t < t_far; ++i) {
+        vec3 p = origin + dir * t;
+        IterState st;
+        float d = distance_estimate(p, st);
+        float threshold = stop * max(1.0, t);
+
+        if (d < threshold) {
+            h.hit = true;
+            h.distance = t;
+
+            // Binary search between the last outside sample and this
+            // one -- same refinement the CPU path does.
+            if (refine > 0 && i > 0) {
+                float lo = prev_t, hi = t;
+                for (int b = 0; b < refine; ++b) {
+                    float mid = 0.5 * (lo + hi);
+                    if (de_only(origin + dir * mid) < threshold) hi = mid; else lo = mid;
+                }
+                h.distance = hi;
+            }
+
+            h.position = origin + dir * h.distance;
+            h.normal = surface_normal(h.position, h.distance);
+            distance_estimate(h.position, h.state);
+            return h;
+        }
+
+        prev_t = t;
+        t += clamp(d * step_mul, threshold * 0.5, step_max);
+    }
+
+    h.distance = t_far;
+    distance_estimate(origin + dir * t_far, h.state);
+    return h;
+}
+
+// ---------------------------------------------------------------------
+// Shading
+// ---------------------------------------------------------------------
+
+vec3 sample_gradient(float t) {
+    float speed = scene.color1.x != 0.0 ? scene.color1.x : 1.0;
+    float u = t * speed + scene.color1.y;
+
+    float cycle = scene.color1.z;
+    if (cycle > 0.0 && cycle != 1.0) {
+        float frac = u - floor(u);
+        u = floor(u) + pow(frac, cycle);
+    }
+    u = fract(u);
+
+    float scaled = u * float(MB3D_GRADIENT_ENTRIES);
+    int i0 = int(scaled) % MB3D_GRADIENT_ENTRIES;
+    int i1 = (i0 + 1) % MB3D_GRADIENT_ENTRIES;
+    float f = fract(scaled);
+
+    uint a = gradient.entries[i0];
+    uint b = gradient.entries[i1];
+    vec3 ca = vec3((a >> 16) & 0xFFu, (a >> 8) & 0xFFu, a & 0xFFu) / 255.0;
+    vec3 cb = vec3((b >> 16) & 0xFFu, (b >> 8) & 0xFFu, b & 0xFFu) / 255.0;
+    return mix(ca, cb, f);
+}
+
+float shadow_ray(vec3 origin, vec3 dir, float max_distance, float softness) {
+    float stop = scene.calc1.x > 0.0 ? scene.calc1.x : 1e-5;
+    float bias = max(stop * 8.0, 1e-6);
+    float t = bias;
+    float result = 1.0;
+    int steps = max(32, int(scene.calc1.y) / 3);
+
+    for (int i = 0; i < steps && t < max_distance; ++i) {
+        float d = de_only(origin + dir * t);
+        if (d < stop * max(1.0, t)) return 0.0;
+        if (softness > 0.0) result = min(result, softness * d / t);
+        t += max(d, bias);
+    }
+    return clamp(result, 0.0, 1.0);
+}
+
+float ambient_occlusion(vec3 p, vec3 n) {
+    int samples = int(scene.post.w);
+    if (samples <= 0) return 1.0;
+    float radius = scene.post.y > 0.0 ? scene.post.y : 0.05;
+
+    float occlusion = 0.0;
+    float weight_sum = 0.0;
+    for (int i = 1; i <= samples; ++i) {
+        float h = radius * float(i) / float(samples);
+        float w = 1.0 / float(1 << i);
+        occlusion += w * (h - de_only(p + n * h));
+        weight_sum += w;
+    }
+    return weight_sum <= 0.0 ? 1.0 : clamp(1.0 - 2.0 * occlusion / weight_sum, 0.0, 1.0);
+}
+
+vec3 background(vec3 dir) {
+    float t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+    return mix(scene.ambient_a.xyz * 0.2, scene.ambient_b.xyz * 0.2, t);
+}
+
+vec3 shade(Hit h, vec3 dir) {
+    if (!h.hit) return background(dir);
+
+    int max_iter = int(scene.calc0.x);
+    float t;
+    if (int(scene.color0.x) != 0 && h.state.trap < 1e29) {
+        t = h.state.trap * scene.color0.z;
+    } else if (scene.color1.w != 0.0 && h.state.escaped_at >= 0) {
+        float r = max(h.state.r, 1.0000001);
+        t = (float(h.state.escaped_at) + 1.0 - log2(log(r))) / float(max(max_iter, 1));
+    } else {
+        t = float(h.state.iteration) / float(max(max_iter, 1));
+    }
+
+    vec3 albedo = sample_gradient(t);
+
+    float far = scene.camera_up.w > 0.0 ? scene.camera_up.w : 100.0;
+    float amb_t = clamp(pow(h.distance / far, max(scene.fog_params.w, 0.01)), 0.0, 1.0);
+    vec3 ambient = mix(scene.ambient_a.xyz, scene.ambient_b.xyz, amb_t);
+
+    float ao = 1.0;
+    if (scene.post.z > 0.0) {
+        ao = 1.0 - (1.0 - ambient_occlusion(h.position, h.normal)) * scene.post.z;
+    }
+
+    vec3 outColor = albedo * ambient * ao;
+    vec3 view = -dir;
+
+    for (int i = 0; i < MB3D_LIGHT_CHANNELS; ++i) {
+        LightChannel ch = scene.lights[i];
+        if (ch.enabled == 0 || ch.kind == 0) continue;
+
+        vec3 to_light;
+        float distance_to_light = 1e30;
+        float attenuation = 1.0;
+
+        if (ch.kind == 2) {
+            to_light = normalize(-ch.position.xyz);
+        } else {
+            vec3 delta = ch.position.xyz - h.position;
+            distance_to_light = length(delta);
+            to_light = distance_to_light > 1e-12 ? delta / distance_to_light : vec3(0, 0, 1);
+            if (ch.color.w > 0.0) {
+                attenuation = 1.0 / (1.0 + ch.color.w * distance_to_light * distance_to_light);
+            }
+        }
+
+        float ndotl = dot(h.normal, to_light);
+        if (ndotl <= 0.0) continue;
+
+        float visibility = 1.0;
+        if (ch.casts_shadow != 0) {
+            visibility = shadow_ray(h.position + h.normal * 1e-4, to_light,
+                                    min(distance_to_light, far), ch.material.w);
+        }
+        if (visibility <= 0.0) continue;
+
+        float diffuse = ndotl * ch.material.y * attenuation * visibility;
+        vec3 halfway = normalize(to_light + view);
+        float spec = ch.position.w > 0.0
+            ? pow(max(dot(h.normal, halfway), 0.0), max(ch.material.x, 1.0))
+              * ch.position.w * attenuation * visibility
+            : 0.0;
+
+        vec3 light_color = ch.color.rgb * ch.intensity;
+        outColor += albedo * light_color * diffuse;
+        outColor += light_color * spec;
+    }
+
+    if (scene.fog_params.z > 0.0) {
+        float fog_t = clamp((h.distance - scene.fog_params.x) /
+                            max(scene.fog_params.y - scene.fog_params.x, 1e-6), 0.0, 1.0);
+        float amount = 1.0 - exp(-scene.fog_params.z * fog_t);
+        outColor = mix(outColor, mix(scene.fog_a.xyz, scene.fog_b.xyz, fog_t), amount);
+    }
+    return outColor;
+}
+
+vec3 tonemap(vec3 linear) {
+    vec3 c = linear * exp2(scene.post.x);
+
+    float saturation = scene.tone.w;
+    if (saturation != 1.0) {
+        float luma = dot(c, vec3(0.2126, 0.7152, 0.0722));
+        c = mix(vec3(luma), c, saturation);
+    }
+    float contrast = scene.tone.y;
+    if (contrast != 1.0) c = (c - 0.5) * contrast + 0.5;
+    c += scene.tone.z;
+
+    float gamma = scene.tone.x > 0.0 ? scene.tone.x : 2.2;
+    return pow(clamp(c, 0.0, 1.0), vec3(1.0 / gamma));
+}
+
+// Deterministic per-pixel jitter -- must match hash01() on the CPU so a
+// tile re-rendered on either backend is identical.
+float hash01(uint x) {
+    x ^= x >> 16; x *= 0x7feb352du;
+    x ^= x >> 15; x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return float(x) * (1.0 / 4294967296.0);
+}
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+
+    ivec2 lo = pc.crop.zw == ivec2(0) ? ivec2(0) : pc.crop.xy;
+    ivec2 hi = pc.crop.zw == ivec2(0) ? pc.image_size : pc.crop.xy + pc.crop.zw;
+    if (any(lessThan(pixel, lo)) || any(greaterThanEqual(pixel, hi))) return;
+
+    int index = pixel.y * pc.image_size.x + pixel.x;
+    int ss = clamp(scene.supersample, 1, 4);
+    float inv_samples = 1.0 / float(ss * ss);
+
+    vec3 accum = vec3(0.0);
+    float depth_accum = 0.0;
+    vec3 normal_accum = vec3(0.0);
+    bool any_hit = false;
+
+    for (int sy = 0; sy < ss; ++sy) {
+        for (int sx = 0; sx < ss; ++sx) {
+            uint seed = uint(pixel.x * 73856093) ^ uint(pixel.y * 19349663)
+                      ^ uint((sy * ss + sx) * 83492791) ^ uint(scene.seed);
+            float jx = ss > 1 ? hash01(seed) : 0.5;
+            float jy = ss > 1 ? hash01(seed ^ 0x9E3779B9u) : 0.5;
+
+            vec2 sample_pos = vec2(pixel) + (vec2(sx, sy) + vec2(jx, jy)) / float(ss);
+            vec2 ndc = vec2((sample_pos.x / float(pc.image_size.x)) * 2.0 - 1.0,
+                            1.0 - (sample_pos.y / float(pc.image_size.y)) * 2.0);
+
+            vec3 origin, dir;
+            if (scene.camera_right.w == 1.0) {   // orthographic
+                origin = scene.camera_origin.xyz
+                       + scene.camera_right.xyz * (ndc.x * scene.camera_origin.w)
+                       + scene.camera_up.xyz * (ndc.y * scene.camera_forward.w);
+                dir = scene.camera_forward.xyz;
+            } else {
+                origin = scene.camera_origin.xyz;
+                dir = normalize(scene.camera_forward.xyz
+                              + scene.camera_right.xyz * (ndc.x * scene.camera_origin.w)
+                              + scene.camera_up.xyz * (ndc.y * scene.camera_forward.w));
+            }
+
+            Hit h = march(origin, dir);
+            accum += shade(h, dir);
+            if (h.hit) {
+                any_hit = true;
+                depth_accum += h.distance;
+                normal_accum += h.normal;
+            }
+        }
+    }
+
+    vec3 linear = accum * inv_samples;
+    out_color.data[index] = vec4(tonemap(linear), any_hit ? 1.0 : 0.0);
+
+    if ((pc.layer_mask & 4) != 0) {
+        // 1e30 rather than infinity: several downstream consumers treat
+        // inf as a decode error.
+        out_depth.data[index] = any_hit ? depth_accum * inv_samples : 1e30;
+    }
+    if ((pc.layer_mask & 8) != 0) {
+        out_normal.data[index] = vec4(any_hit ? normalize(normal_accum) : vec3(0.0), 0.0);
+    }
+}

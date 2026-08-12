@@ -1,0 +1,131 @@
+{
+  "_comment": [
+    "Canonical third-party inventory. THIRD-PARTY-NOTICES.md is generated",
+    "from this file by cmake/GenerateNotices.cmake -- edit here, not there.",
+    "",
+    "'requires' names the MB3D_WITH_* option that pulls the component in;",
+    "'always' means it is unconditional. 'linkage' is checked by the",
+    "generator: any LGPL component declaring anything other than 'dynamic'",
+    "fails the build, because static linking would void the relink right",
+    "that makes LGPL compatible with a proprietary work at all."
+  ],
+  "components": [
+    {
+      "name": "GLM",
+      "version": "1.0.1",
+      "license": "MIT",
+      "linkage": "header-only",
+      "url": "https://github.com/g-truc/glm",
+      "purpose": "vector and matrix maths",
+      "requires": "always"
+    },
+    {
+      "name": "volk",
+      "version": "1.3.270",
+      "license": "MIT",
+      "linkage": "header-only",
+      "url": "https://github.com/zeux/volk",
+      "purpose": "Vulkan entry-point loading",
+      "requires": "vulkan"
+    },
+    {
+      "name": "VulkanMemoryAllocator",
+      "version": "3.1.0",
+      "license": "MIT",
+      "linkage": "header-only",
+      "url": "https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator",
+      "purpose": "GPU memory allocation",
+      "requires": "vulkan"
+    },
+    {
+      "name": "Vulkan-Headers",
+      "version": "1.3.x",
+      "license": "Apache-2.0",
+      "linkage": "header-only",
+      "url": "https://github.com/KhronosGroup/Vulkan-Headers",
+      "purpose": "Vulkan API declarations",
+      "requires": "vulkan"
+    },
+    {
+      "name": "sol2",
+      "version": "3.3.0",
+      "license": "MIT",
+      "linkage": "header-only",
+      "url": "https://github.com/ThePhD/sol2",
+      "purpose": "C++ to Lua binding",
+      "requires": "lua"
+    },
+    {
+      "name": "LuaJIT",
+      "version": "2.1",
+      "license": "MIT",
+      "linkage": "dynamic",
+      "url": "https://luajit.org/",
+      "purpose": "scripting runtime (sandboxed: no io, os, package, ffi)",
+      "requires": "lua"
+    },
+    {
+      "name": "tinyexr",
+      "version": "1.0.8",
+      "license": "BSD-3-Clause",
+      "linkage": "header-only",
+      "url": "https://github.com/syoyo/tinyexr",
+      "purpose": "multi-layer OpenEXR output",
+      "requires": "tinyexr"
+    },
+    {
+      "name": "miniz",
+      "version": "3.0.2",
+      "license": "MIT",
+      "linkage": "static",
+      "url": "https://github.com/richgel999/miniz",
+      "purpose": "DEFLATE for the compressed legacy containers",
+      "requires": "miniz"
+    },
+    {
+      "name": "OpenCASCADE",
+      "version": "7.8.x",
+      "license": "LGPL-2.1-or-later WITH OCCT-exception-1.0",
+      "linkage": "dynamic",
+      "url": "https://dev.opencascade.org/",
+      "purpose": "STEP (ISO 10303) B-Rep export",
+      "requires": "opencascade"
+    },
+    {
+      "name": "gRPC",
+      "version": "1.62.x",
+      "license": "Apache-2.0",
+      "linkage": "dynamic",
+      "url": "https://grpc.io/",
+      "purpose": "distributed tile dispatch",
+      "requires": "grpc"
+    },
+    {
+      "name": "Protobuf",
+      "version": "25.x",
+      "license": "BSD-3-Clause",
+      "linkage": "dynamic",
+      "url": "https://protobuf.dev/",
+      "purpose": "gRPC message serialisation",
+      "requires": "grpc"
+    },
+    {
+      "name": "DockPanelSuite",
+      "version": "3.1.1",
+      "license": "MIT",
+      "linkage": "managed",
+      "url": "https://github.com/dockpanelsuite/dockpanelsuite",
+      "purpose": "WinForms docking layout",
+      "requires": "always"
+    },
+    {
+      "name": "AvalonEdit",
+      "version": "6.3.0.90",
+      "license": "MIT",
+      "linkage": "managed",
+      "url": "https://github.com/icsharpcode/AvalonEdit",
+      "purpose": "GLSL and Lua source editing",
+      "requires": "always"
+    }
+  ]
+}
