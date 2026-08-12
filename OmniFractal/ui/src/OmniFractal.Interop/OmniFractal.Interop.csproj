@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    SPDX-License-Identifier: LicenseRef-OmniFractal-Proprietary
+    Copyright (c) 2026 KenTread. All Rights Reserved.
+
+    The interop assembly. AllowUnsafeBlocks is mandatory: every struct
+    here is a blittable mirror of a C struct using fixed-size buffers,
+    which is what makes the boundary zero-copy.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <LangVersion>13.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <!-- Required for [LibraryImport] source generation. -->
+    <EnableLibraryImportGenerator>true</EnableLibraryImportGenerator>
+    <IsAotCompatible>true</IsAotCompatible>
+    <RootNamespace>OmniFractal.Interop</RootNamespace>
+    <AssemblyName>OmniFractal.Interop</AssemblyName>
+  </PropertyGroup>
+
+</Project>
